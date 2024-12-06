@@ -161,3 +161,6 @@ cython_debug/
 
 # model results
 *.pkl
+
+# figures
+*.html
