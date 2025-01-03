@@ -6,11 +6,13 @@ from typing import Tuple, List
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
+# ACI
 def compute_aci_bounds(
     observations: pd.Series,
     predictions: pd.Series,
     calibration_end: pd.Timestamp,
-    alpha: float = 0.1
+    alpha: float = 0.1,
+    gamma: float = 1e-3
 ) -> Tuple[List[float], List[float]]:
     """
     Compute Adaptive Conformal Inference bounds for time series predictions.
@@ -20,6 +22,7 @@ def compute_aci_bounds(
         predictions: Series of predicted values
         calibration_end: End timestamp of calibration period
         alpha: Significance level (default 0.1 for 90% confidence)
+        gamma: Update rate for alpha (default 1e-3)
         
     Returns:
         Tuple of (lower_bounds, upper_bounds)
@@ -38,6 +41,9 @@ def compute_aci_bounds(
     lower_bounds = []
     upper_bounds = []
     
+    # Initialize alpha_t for the desired confidence level
+    alpha_t = alpha
+    
     # Process test period
     test_indices = observations.index >= calibration_end
     
@@ -51,13 +57,25 @@ def compute_aci_bounds(
             residuals.pop(0)
             
         # Compute quantile
-        quantile_idx = np.ceil((window_size + 1) * (1 - alpha)) / window_size
-        q_alpha = np.quantile(residuals, quantile_idx)
+        quantile_idx = np.ceil((window_size + 1) * (1 - alpha_t)) / window_size
+        quantile_idx = np.clip(quantile_idx, 0, 1) # clip quantile_idx to be between 0 and 1
+        assert quantile_idx >= 0 and quantile_idx <= 1, f'Quantile value should be between 0 and 1, but is {quantile_idx}'
+        q_alpha_t = np.quantile(residuals, quantile_idx)
+        assert not np.isnan(q_alpha_t), f'Quantile value should not be NaN'
+        
+        # Check if the observation is bounded
+        is_lower_bounded = observations[idx] > predictions[idx] - q_alpha_t
+        is_upper_bounded = observations[idx] < predictions[idx] + q_alpha_t
+        is_not_bounded = not (is_lower_bounded and is_upper_bounded)
+        
+        # Adjust alpha_t dynamically relative to desired coverage
+        alpha_t += gamma * (alpha - is_not_bounded)
+        alpha_t = np.clip(alpha_t, 0, 1)  # Ensure alpha_t stays in [0, 1]
         
         # Generate prediction intervals
         current_pred = predictions[idx]
-        lower_bounds.append(current_pred - q_alpha)
-        upper_bounds.append(current_pred + q_alpha)
+        lower_bounds.append(current_pred - q_alpha_t)
+        upper_bounds.append(current_pred + q_alpha_t)
     
     # Add NaNs for calibration period
     lower_bounds = [np.nan] * window_size + lower_bounds
@@ -66,6 +84,101 @@ def compute_aci_bounds(
     return lower_bounds, upper_bounds
 
 
+# metrics
+def PICP(
+    y_true: pd.Series, 
+    lower: List[float], 
+    upper: List[float]
+) -> float:
+    """Prediction Interval Coverage Probability
+    
+    Args:
+        y_true: Series of true values
+        lower: List of lower bound values
+        upper: List of upper bound values
+        
+    Returns:
+        Tuple of (PICP for each sample, mean PICP)
+    """
+    # Calculate PICP for each timestep
+    in_interval = np.logical_and(y_true >= lower, y_true <= upper)
+    interval_PICP = np.mean(in_interval)
+    
+    return interval_PICP
+
+def PIAW(
+    lower: List[float], 
+    upper: List[float]
+) -> float:
+    """Prediction Interval Average Width
+    
+    Args:
+        y_true: Series of true values
+        lower: List of lower bound values
+        upper: List of upper bound values
+        
+    Returns:
+        Tuple of (PIAW for each timestep, mean PIAW)
+    """
+    # Calculate PIAW for each timestep
+    widths = np.array(upper) - np.array(lower)
+    mean_width = np.mean(widths)
+    
+    return mean_width
+
+def _winkler(
+    y_true: float, 
+    lower: float, 
+    upper: float, 
+    alpha: float
+) -> float:
+    """Winkler Score
+    Source:https://www.kaggle.com/datasets/carlmcbrideellis/winkler-interval-score-metric
+    Args:
+        y_true: True value
+        lower: Lower bound of the prediction interval
+        upper: Upper bound of the prediction interval
+        alpha: Significance level (e.g., 0.1 for 90% confidence interval)
+        
+    Returns:
+        Winkler score for the given prediction interval
+    """
+    # Ensure inputs are valid
+    assert not np.isnan(y_true), "y_true contains NaN value(s)"
+    assert not np.isinf(y_true), "y_true contains inf value(s)"
+    assert not np.isnan(lower), "lower interval value contains NaN value(s)"
+    assert not np.isinf(lower), "lower interval value contains inf value(s)"
+    assert not np.isnan(upper), "upper interval value contains NaN value(s)"
+    assert not np.isinf(upper), "upper interval value contains inf value(s)"
+    assert 0 < alpha <= 1, f"alpha should be (0,1]. Found: {alpha}"
+
+    # Calculate Winkler score
+    score = np.abs(upper - lower)
+    if y_true < lower:
+        score += (2 / alpha) * (lower - y_true)
+    elif y_true > upper:
+        score += (2 / alpha) * (y_true - upper)
+    
+    return score
+
+def evaluate(
+    y_true: pd.Series, 
+    lower: List[float], 
+    upper: List[float], 
+    alpha: float
+) -> dict[str, float]:
+    picp = PICP(y_true, lower, upper)
+    piaw = PIAW(lower, upper)
+    winkler = np.vectorize(_winkler)  # vectorize the winkler function
+    winkler_scores = winkler(y_true, lower, upper, alpha)
+    return {
+        "PICP": picp,
+        "PIAW": piaw,
+        "mean_Winkler": np.mean(winkler_scores)
+    }
+
+
+# plotting
 def plot_predictions_with_bounds(
     time_index: pd.DatetimeIndex,
     observations: pd.Series,
@@ -231,13 +344,26 @@ if __name__ == "__main__":
     lower_bounds, upper_bounds = compute_aci_bounds(
         observations=lead_time_1['obs'],
         predictions=lead_time_1['sim'],
-        calibration_end=calibration_end
+        calibration_end=calibration_end,
+        gamma=3e-3
     )
     print("finish computing ACI bounds")
-    
+
+    # evaluation
+    evaluation = evaluate(
+        y_true=lead_time_1['obs'],
+        lower=lower_bounds,
+        upper=upper_bounds,
+        alpha=0.1
+    )
+    print(evaluation)
+
     # Define plotting period (adjust these dates as needed)
-    plot_start = lead_time_1.index.min() # pd.Timestamp('2021-07-16')
-    plot_end = lead_time_1.index.max() # pd.Timestamp('2021-07-19')
+    # plot_start = pd.Timestamp('2021-07-16') # lead_time_1.index.min()
+    # plot_end = pd.Timestamp('2021-07-19') # lead_time_1.index.max()
+
+    plot_start = pd.Timestamp('2020-02-07')
+    plot_end = pd.Timestamp('2020-02-08')
     
     # Plot results
     fig = plot_predictions_with_bounds(
@@ -250,10 +376,11 @@ if __name__ == "__main__":
         plot_start=plot_start,
         plot_end=plot_end,
         title=f"ACI Prediction Intervals ({plot_start.date()} to {plot_end.date()})",
-        save_path=visual_dir / f"aci_predictions_{plot_start.date()}_{plot_end.date()}.html",  # Save as interactive HTML
+        save_path=visual_dir / f"aci_predictions_{plot_start.date()}_{plot_end.date()}_gamma.html",  # Save as interactive HTML
         # Or save as static image:
         # save_path="aci_predictions.png", save_format="png"
     )
+
     
     
     
