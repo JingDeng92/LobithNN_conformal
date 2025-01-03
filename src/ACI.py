@@ -98,10 +98,16 @@ def PICP(
         upper: List of upper bound values
         
     Returns:
-        Tuple of (PICP for each sample, mean PICP)
+        PICP for the non-NaN samples
     """
+    # Filter out NaN values
+    valid_mask = ~np.isnan(y_true) & ~np.isnan(lower) & ~np.isnan(upper)
+    y_true_valid = y_true[valid_mask]
+    lower_valid = np.array(lower)[valid_mask]
+    upper_valid = np.array(upper)[valid_mask]
+    
     # Calculate PICP for each timestep
-    in_interval = np.logical_and(y_true >= lower, y_true <= upper)
+    in_interval = np.logical_and(y_true_valid >= lower_valid, y_true_valid <= upper_valid)
     interval_PICP = np.mean(in_interval)
     
     return interval_PICP
@@ -113,53 +119,62 @@ def PIAW(
     """Prediction Interval Average Width
     
     Args:
-        y_true: Series of true values
         lower: List of lower bound values
         upper: List of upper bound values
         
     Returns:
-        Tuple of (PIAW for each timestep, mean PIAW)
+        PIAW for the non-NaN samples
     """
+    # Convert to arrays and filter out NaN values
+    lower_array = np.array(lower)
+    upper_array = np.array(upper)
+    valid_mask = ~np.isnan(lower_array) & ~np.isnan(upper_array)
+    lower_valid = lower_array[valid_mask]
+    upper_valid = upper_array[valid_mask]
+    
     # Calculate PIAW for each timestep
-    widths = np.array(upper) - np.array(lower)
+    widths = upper_valid - lower_valid
     mean_width = np.mean(widths)
     
     return mean_width
 
-def _winkler(
-    y_true: float, 
-    lower: float, 
-    upper: float, 
+def winkler(
+    y_true: pd.Series, 
+    lower: List[float], 
+    upper: List[float], 
     alpha: float
-) -> float:
+) -> List[float]:
     """Winkler Score
     Source:https://www.kaggle.com/datasets/carlmcbrideellis/winkler-interval-score-metric
     Args:
-        y_true: True value
-        lower: Lower bound of the prediction interval
-        upper: Upper bound of the prediction interval
+        y_true: Series of true values
+        lower: List of lower bound values
+        upper: List of upper bound values
         alpha: Significance level (e.g., 0.1 for 90% confidence interval)
         
     Returns:
-        Winkler score for the given prediction interval
+        List of Winkler scores for each prediction interval
     """
     # Ensure inputs are valid
-    assert not np.isnan(y_true), "y_true contains NaN value(s)"
-    assert not np.isinf(y_true), "y_true contains inf value(s)"
-    assert not np.isnan(lower), "lower interval value contains NaN value(s)"
-    assert not np.isinf(lower), "lower interval value contains inf value(s)"
-    assert not np.isnan(upper), "upper interval value contains NaN value(s)"
-    assert not np.isinf(upper), "upper interval value contains inf value(s)"
-    assert 0 < alpha <= 1, f"alpha should be (0,1]. Found: {alpha}"
+    assert len(y_true) == len(lower) == len(upper), "Input lengths must match"
+    assert alpha > 0 and alpha <= 1,  f"alpha should be (0,1]. Found: {alpha}"
 
-    # Calculate Winkler score
-    score = np.abs(upper - lower)
-    if y_true < lower:
-        score += (2 / alpha) * (lower - y_true)
-    elif y_true > upper:
-        score += (2 / alpha) * (y_true - upper)
+    scores = []
+    for yt, lb, ub in zip(y_true, lower, upper):
+        # Check for NaN values
+        if np.isnan(yt) or np.isnan(lb) or np.isnan(ub):
+            continue  # Skip this iteration if any value is NaN
+        
+        # Calculate Winkler score for each element
+        score = np.abs(ub - lb)
+        if yt < lb:
+            score += (2 / alpha) * (lb - yt)
+        elif yt > ub:
+            score += (2 / alpha) * (yt - ub)
+        
+        scores.append(score)
     
-    return score
+    return scores
 
 def evaluate(
     y_true: pd.Series, 
@@ -169,12 +184,11 @@ def evaluate(
 ) -> dict[str, float]:
     picp = PICP(y_true, lower, upper)
     piaw = PIAW(lower, upper)
-    winkler = np.vectorize(_winkler)  # vectorize the winkler function
     winkler_scores = winkler(y_true, lower, upper, alpha)
     return {
-        "PICP": picp,
-        "PIAW": piaw,
-        "mean_Winkler": np.mean(winkler_scores)
+        "PICP": round(picp, 4),
+        "PIAW": round(piaw, 4),
+        "mean_Winkler": round(np.mean(winkler_scores), 4)
     }
 
 
@@ -340,12 +354,13 @@ if __name__ == "__main__":
     start_time = lead_time_1.index.min()
     calibration_end = start_time + pd.DateOffset(years=1)
     
-    # Compute ACI bounds
+    # --------------TEST:Compute ACI bounds------------------------
+    gamma = 8e-3
     lower_bounds, upper_bounds = compute_aci_bounds(
         observations=lead_time_1['obs'],
         predictions=lead_time_1['sim'],
         calibration_end=calibration_end,
-        gamma=3e-3
+        gamma=gamma
     )
     print("finish computing ACI bounds")
 
@@ -356,8 +371,100 @@ if __name__ == "__main__":
         upper=upper_bounds,
         alpha=0.1
     )
-    print(evaluation)
+    print("gamma", gamma)
+    print("evaluation", evaluation)
 
+    # Define plotting period (adjust these dates as needed)
+    # plot_start = pd.Timestamp('2021-07-16') # lead_time_1.index.min()
+    # plot_end = pd.Timestamp('2021-07-19') # lead_time_1.index.max()
+
+    plot_start = pd.Timestamp('2020-02-07')
+    plot_end = pd.Timestamp('2020-02-08')
+    
+    # Plot results
+    fig = plot_predictions_with_bounds(
+        time_index=lead_time_1.index,
+        observations=lead_time_1['obs'],
+        predictions=lead_time_1['sim'],
+        lower_bounds=lower_bounds,
+        upper_bounds=upper_bounds,
+        calibration_end=calibration_end,
+        plot_start=plot_start,
+        plot_end=plot_end,
+        title=f"ACI Prediction Intervals ({plot_start.date()} to {plot_end.date()})",
+        save_path=visual_dir / f"aci_predictions_{plot_start.date()}_{plot_end.date()}_gamma{gamma}.html",  # Save as interactive HTML
+        # Or save as static image:
+        # save_path="aci_predictions.png", save_format="png"
+    )
+
+    # -------------OPTIMIZE gamma----------------------------------
+    import matplotlib.pyplot as plt
+
+    # Define gamma values for experiments
+    gamma_values = np.linspace(1e-3, 2e-2, 20)
+
+    # Store evaluation results
+    evaluation_results = []
+
+    for gamma in gamma_values:
+        # Compute ACI bounds
+        lower_bounds, upper_bounds = compute_aci_bounds(
+            observations=lead_time_1['obs'],
+            predictions=lead_time_1['sim'],
+            calibration_end=calibration_end,
+            gamma=gamma
+        )
+        
+        # Evaluate the results
+        evaluation = evaluate(
+            y_true=lead_time_1['obs'],
+            lower=lower_bounds,
+            upper=upper_bounds,
+            alpha=0.1
+        )
+        
+        # Store the evaluation metrics
+        evaluation_results.append(evaluation)
+        print(f"gamma: {gamma}, evaluation: {evaluation}")
+
+    # Extract metrics for plotting
+    picp_values = [result['PICP'] for result in evaluation_results]
+    piaw_values = [result['PIAW'] for result in evaluation_results]
+    mean_winkler_values = [result['mean_Winkler'] for result in evaluation_results]
+
+    # Plot the metrics
+    fig, ax1 = plt.subplots(figsize=(12, 6))
+
+    # Plot PICP on the first y-axis
+    ax1.plot(gamma_values, picp_values, label='PICP', marker='o', color='b')
+    ax1.set_xlabel('Gamma')
+    ax1.set_ylabel('PICP', color='b')
+    ax1.tick_params(axis='y', labelcolor='b')
+
+    # Create a second y-axis for PIAW
+    ax2 = ax1.twinx()
+    ax2.plot(gamma_values, piaw_values, label='PIAW', marker='o', color='g')
+    ax2.set_ylabel('PIAW', color='g')
+    ax2.tick_params(axis='y', labelcolor='g')
+
+    # Create a third y-axis for Mean Winkler
+    ax3 = ax1.twinx()
+    ax3.spines['right'].set_position(('outward', 60))  # Offset the third y-axis
+    ax3.plot(gamma_values, mean_winkler_values, label='Mean Winkler', marker='o', color='r')
+    ax3.set_ylabel('Mean Winkler', color='r')
+    ax3.tick_params(axis='y', labelcolor='r')
+
+    # Add a title and grid
+    plt.title('Evaluation Metrics vs Gamma')
+    ax1.grid(True)
+
+    # Show the plot
+    plt.show()
+
+
+
+
+#%% plot
     # Define plotting period (adjust these dates as needed)
     # plot_start = pd.Timestamp('2021-07-16') # lead_time_1.index.min()
     # plot_end = pd.Timestamp('2021-07-19') # lead_time_1.index.max()
