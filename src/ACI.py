@@ -28,7 +28,7 @@ def compute_aci_bounds(
         Tuple of (lower_bounds, upper_bounds)
     """
     # Initialize calibration window
-    calibration_mask = observations.index < calibration_end
+    calibration_mask = predictions.index < calibration_end
     window_size = calibration_mask.sum()
     
     # Initialize residuals with calibration period
@@ -45,23 +45,29 @@ def compute_aci_bounds(
     alpha_t = alpha
     
     # Process test period
-    test_indices = observations.index >= calibration_end
+    test_indices = predictions.index >= calibration_end
     
-    for idx in observations[test_indices].index:
-        # Calculate new residual
+    for idx in predictions[test_indices].index:
+        
+        # Compute quantile (the observation for this timestep is not known yet)
+        quantile_idx = np.ceil((window_size + 1) * (1 - alpha_t)) / window_size
+        quantile_idx = np.clip(quantile_idx, 0, 1) # clip quantile_idx to be between 0 and 1
+        assert quantile_idx >= 0 and quantile_idx <= 1, f'Quantile value should be between 0 and 1, but is {quantile_idx}'
+        q_alpha_t = np.quantile(residuals, quantile_idx)
+        assert not np.isnan(q_alpha_t), f'Quantile value should not be NaN'
+
+        # Generate prediction intervals
+        current_pred = predictions[idx]
+        lower_bounds.append(current_pred - q_alpha_t)
+        upper_bounds.append(current_pred + q_alpha_t)
+        
+        # Calculate new residual (now the observation is known, the residuals and alpha can be updated)
         new_residual = np.abs(observations[idx] - predictions[idx])
         
         # Update residuals array
         residuals.append(new_residual)
         if len(residuals) > window_size:
             residuals.pop(0)
-            
-        # Compute quantile
-        quantile_idx = np.ceil((window_size + 1) * (1 - alpha_t)) / window_size
-        quantile_idx = np.clip(quantile_idx, 0, 1) # clip quantile_idx to be between 0 and 1
-        assert quantile_idx >= 0 and quantile_idx <= 1, f'Quantile value should be between 0 and 1, but is {quantile_idx}'
-        q_alpha_t = np.quantile(residuals, quantile_idx)
-        assert not np.isnan(q_alpha_t), f'Quantile value should not be NaN'
         
         # Check if the observation is bounded
         is_lower_bounded = observations[idx] > predictions[idx] - q_alpha_t
@@ -72,11 +78,6 @@ def compute_aci_bounds(
         alpha_t += gamma * (alpha - is_not_bounded)
         alpha_t = np.clip(alpha_t, 0, 1)  # Ensure alpha_t stays in [0, 1]
         
-        # Generate prediction intervals
-        current_pred = predictions[idx]
-        lower_bounds.append(current_pred - q_alpha_t)
-        upper_bounds.append(current_pred + q_alpha_t)
-    
     # Add NaNs for calibration period
     lower_bounds = [np.nan] * window_size + lower_bounds
     upper_bounds = [np.nan] * window_size + upper_bounds
@@ -177,18 +178,28 @@ def winkler(
     return scores
 
 def evaluate(
-    y_true: pd.Series, 
+    y_true: pd.Series,
+    calibration_end: pd.Timestamp, 
     lower: List[float], 
     upper: List[float], 
     alpha: float
 ) -> dict[str, float]:
-    picp = PICP(y_true, lower, upper)
-    piaw = PIAW(lower, upper)
-    winkler_scores = winkler(y_true, lower, upper, alpha)
+    # Filter for the test period
+    test_mask = y_true.index >= calibration_end
+    y_true_test = y_true[test_mask]
+    lower_test = np.array(lower)[test_mask]
+    upper_test = np.array(upper)[test_mask]
+    
+    picp = PICP(y_true_test, lower_test, upper_test)
+    piaw = PIAW(lower_test, upper_test)
+    winkler_scores = winkler(y_true_test, lower_test, upper_test, alpha)
+    
     return {
         "PICP": round(picp, 4),
         "PIAW": round(piaw, 4),
-        "mean_Winkler": round(np.mean(winkler_scores), 4)
+        "mean_Winkler": round(np.mean(winkler_scores), 4),
+        "winkler": [round(score, 4) for score in winkler_scores],
+        "y_true_test": y_true_test.tolist(),
     }
 
 
@@ -367,6 +378,7 @@ if __name__ == "__main__":
     # evaluation
     evaluation = evaluate(
         y_true=lead_time_1['obs'],
+        calibration_end=calibration_end,
         lower=lower_bounds,
         upper=upper_bounds,
         alpha=0.1
@@ -374,12 +386,54 @@ if __name__ == "__main__":
     print("gamma", gamma)
     print("evaluation", evaluation)
 
+    # plot evaluation results
+    # Compute mean Winkler scores for different y_true_test ranges
+    y_true_array = np.array(evaluation['y_true_test'])
+    winkler_array = np.array(evaluation['winkler'])
+    
+    # Define bins (0-1000, 1000-2000, etc.)
+    bin_edges = np.arange(0, np.ceil(max(y_true_array)/1000)*1000 + 1000, 1000)
+    bin_labels = [f'{int(bin_edges[i])}-{int(bin_edges[i+1])}' for i in range(len(bin_edges)-1)]
+    
+    # Calculate mean Winkler score for each bin
+    mean_winkler_by_bin = []
+    bin_counts = []
+    
+    for i in range(len(bin_edges)-1):
+        mask = (y_true_array >= bin_edges[i]) & (y_true_array < bin_edges[i+1])
+        if np.any(mask):
+            mean_winkler = np.mean(winkler_array[mask])
+            mean_winkler_by_bin.append(mean_winkler)
+            bin_counts.append(np.sum(mask))
+        else:
+            mean_winkler_by_bin.append(0)
+            bin_counts.append(0)
+    
+    # Create bar plot
+    plt.figure(figsize=(10, 6))
+    bars = plt.bar(bin_labels, mean_winkler_by_bin)
+    
+    # Add value labels on top of each bar
+    for i, (bar, count) in enumerate(zip(bars, bin_counts)):
+        height = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2., height,
+                f'n={count}\n{height:.1f}',
+                ha='center', va='bottom')
+    
+    plt.title('Mean Winkler Score by Discharge Range')
+    plt.xlabel('Discharge Range (m³/s)')
+    plt.ylabel('Mean Winkler Score')
+    plt.xticks(rotation=45)
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
     # Define plotting period (adjust these dates as needed)
     # plot_start = pd.Timestamp('2021-07-16') # lead_time_1.index.min()
     # plot_end = pd.Timestamp('2021-07-19') # lead_time_1.index.max()
 
-    plot_start = pd.Timestamp('2020-02-07')
-    plot_end = pd.Timestamp('2020-02-08')
+    plot_start = pd.Timestamp('2021-02-05')
+    plot_end = pd.Timestamp('2021-02-08')
     
     # Plot results
     fig = plot_predictions_with_bounds(
@@ -396,6 +450,7 @@ if __name__ == "__main__":
         # Or save as static image:
         # save_path="aci_predictions.png", save_format="png"
     )
+
 
     # -------------OPTIMIZE gamma----------------------------------
     import matplotlib.pyplot as plt
@@ -460,34 +515,6 @@ if __name__ == "__main__":
 
     # Show the plot
     plt.show()
-
-
-
-
-#%% plot
-    # Define plotting period (adjust these dates as needed)
-    # plot_start = pd.Timestamp('2021-07-16') # lead_time_1.index.min()
-    # plot_end = pd.Timestamp('2021-07-19') # lead_time_1.index.max()
-
-    plot_start = pd.Timestamp('2020-02-07')
-    plot_end = pd.Timestamp('2020-02-08')
-    
-    # Plot results
-    fig = plot_predictions_with_bounds(
-        time_index=lead_time_1.index,
-        observations=lead_time_1['obs'],
-        predictions=lead_time_1['sim'],
-        lower_bounds=lower_bounds,
-        upper_bounds=upper_bounds,
-        calibration_end=calibration_end,
-        plot_start=plot_start,
-        plot_end=plot_end,
-        title=f"ACI Prediction Intervals ({plot_start.date()} to {plot_end.date()})",
-        save_path=visual_dir / f"aci_predictions_{plot_start.date()}_{plot_end.date()}_gamma.html",  # Save as interactive HTML
-        # Or save as static image:
-        # save_path="aci_predictions.png", save_format="png"
-    )
-
     
     
     
