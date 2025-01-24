@@ -432,8 +432,8 @@ if __name__ == "__main__":
     # plot_start = pd.Timestamp('2021-07-16') # lead_time_1.index.min()
     # plot_end = pd.Timestamp('2021-07-19') # lead_time_1.index.max()
 
-    plot_start = pd.Timestamp('2021-02-05')
-    plot_end = pd.Timestamp('2021-02-08')
+    plot_start = pd.Timestamp('2021-07-16')
+    plot_end = pd.Timestamp('2021-07-19')
     
     # Plot results
     fig = plot_predictions_with_bounds(
@@ -473,6 +473,7 @@ if __name__ == "__main__":
         # Evaluate the results
         evaluation = evaluate(
             y_true=lead_time_1['obs'],
+            calibration_end=calibration_end,
             lower=lower_bounds,
             upper=upper_bounds,
             alpha=0.1
